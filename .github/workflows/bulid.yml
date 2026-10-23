@@ -8,61 +8,67 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # needed to attach cxps5.elf to a release on tags
+  contents: write # needed to attach cxps5.elf to a release on tags
 
 env:
   PS5_PAYLOAD_SDK: /opt/ps5-payload-sdk
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld zlib1g-dev python3 zip curl unzip
+          sudo apt-get install -y clang lld zlib1g-dev python3 zip curl unzip file
 
       # Host build + API tests against a fake game folder (no console needed).
       - name: Host tests
         run: make test
 
-      # Prebuilt SDK release; falls back to building the SDK from source if the download fails.
-      - name: Install ps5-payload-sdk
+      # Prebuilt library bundle (curl, openssl, zlib, ...) from pacbrew-repo, unpacked to /opt/ps5-payload-sdk,
+      # then the SDK release on top of it so the SDK wins.
+      - name: Install ps5-payload-sdk and libraries
         run: |
           set -x
+          sudo mkdir -p /opt
+          if curl -fL --retry 3 -o libs.tar.gz \
+              https://github.com/ps5-payload-dev/pacbrew-repo/releases/latest/download/ps5-payload-dev.tar.gz; then
+            sudo tar xf libs.tar.gz -C /
+          else
+            echo "::warning::could not download the pacbrew library bundle"
+          fi
           if curl -fL --retry 3 -o sdk.zip \
               https://github.com/ps5-payload-dev/sdk/releases/latest/download/ps5-payload-sdk.zip; then
             sudo unzip -q -o -d /opt sdk.zip
-          else
+          elif [ ! -x "$PS5_PAYLOAD_SDK/bin/prospero-clang" ]; then
             git clone --depth 1 https://github.com/ps5-payload-dev/sdk
-            sudo mkdir -p "$PS5_PAYLOAD_SDK"
-            make -C sdk DESTDIR=/opt clean install || sudo make -C sdk DESTDIR=/opt clean install
+            sudo make -C sdk DESTDIR="$PS5_PAYLOAD_SDK" clean install
           fi
           test -x "$PS5_PAYLOAD_SDK/bin/prospero-clang" || { ls -R /opt | head -50; exit 1; }
           echo "$PS5_PAYLOAD_SDK/bin" >> "$GITHUB_PATH"
-
-      # Optional: libcurl/openssl ports (pacbrew). If this fails the build continues without link downloads.
-      - name: Install curl/openssl ports (optional)
-        continue-on-error: true
-        run: |
-          set -x
-          git clone --depth 1 https://github.com/ps5-payload-dev/pacbrew-repo
-          cd pacbrew-repo
-          ls
-          for p in zlib zstd libpsl openssl curl; do
-            (cd "$p" 2>/dev/null && makepkg -f --noconfirm --nodeps && \
-              sudo pacbrew-pacman -U --noconfirm *.pkg.tar.gz) || echo "port $p failed"
-          done
+          ls "$PS5_PAYLOAD_SDK/target/user/homebrew/include" | head -50 || true
+          ls "$PS5_PAYLOAD_SDK/target/user/homebrew/lib" | grep -E "curl|ssl|crypto|zstd|psl|libz" || true
 
       - name: Build cxps5.elf
         run: |
-          if [ -f "$PS5_PAYLOAD_SDK/target/user/homebrew/include/curl/curl.h" ]; then
-            make
+          set -x
+          echo "commit: $(git log -1 --oneline)"
+          mkdir -p build
+          python3 tools/embed.py ui/index.html build/ui_html.h UI_HTML
+          INC="$PS5_PAYLOAD_SDK/target/user/homebrew/include"
+          CC="$PS5_PAYLOAD_SDK/bin/prospero-clang"
+          COMMON="-O2 -std=gnu11 -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -Ibuild -isystem $INC"
+          rm -f cxps5.elf
+          if [ -f "$INC/curl/curl.h" ] && "$CC" $COMMON -DHAVE_CURL -DCACERT_PATH="\"$PWD/third_party/cacert.pem\"" \
+               -o cxps5.elf src/cxps5.c -lcurl -lssl -lcrypto -lz -lzstd -lpsl; then
+            echo "built WITH curl (link downloads enabled)"
           else
-            echo "::warning::No curl port in SDK, building with NO_CURL=1 (upload only, no link downloads)"
-            make NO_CURL=1
+            echo "::warning::curl build failed or curl port missing, building without link downloads"
+            rm -f cxps5.elf
+            "$CC" $COMMON -o cxps5.elf src/cxps5.c -lz
           fi
           ls -l cxps5.elf
           file cxps5.elf
